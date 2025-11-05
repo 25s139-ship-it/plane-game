@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Flappy Plane — Web Edition</title>
+  <style>
+    html,body{height:100%;margin:0}
+    body{display:flex;align-items:center;justify-content:center;background:#87CEEB;font-family:Arial,Helvetica,sans-serif}
+    canvas{background:#87CEEB;display:block;box-shadow:0 6px 20px rgba(0,0,0,0.2)}
+    #info{position:fixed;left:12px;top:12px;color:#111}
+    #centerHint{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);text-align:center;color:#111}
+    button{padding:8px 12px;margin-top:8px}
+  </style>
+</head>
+<body>
+  <canvas id="game" width="800" height="600"></canvas>
+  <div id="info"></div>
+  <div id="centerHint"></div>
+
+<script>
+// Flappy Plane — Web port of the provided pygame code
+// Controls: SPACE or Left Click -> flap, R -> restart, ESC -> quit (stops the game loop)
+// Image assets (same URLs as in your Python file)
+const PLANE_URL = "https://terrorist.center/assets/plane.png";
+const EXPLOSION_URL = "https://terrorist.center/assets/explosion.png";
+
+const WIDTH = 800, HEIGHT = 600;
+const FPS = 60;
+const PIPE_WIDTH = 80;
+const PIPE_GAP = 140;
+const PIPE_DISTANCE = 300;
+const PIPE_SPEED = 3.5;
+const GRAVITY = 0.5;
+const FLAP_STRENGTH = -7.8;
+const MAX_DROP_SPEED = 12;
+const GROUND_HEIGHT = 90;
+const BIRD_WIDTH = 85;
+const BIRD_HEIGHT = 30;
+const BIRD_X = Math.floor(WIDTH * 0.2);
+const EXPLOSION_SIZE = 96;
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const info = document.getElementById('info');
+const centerHint = document.getElementById('centerHint');
+
+let planeImg = null, explosionImg = null;
+let imagesLoaded = 0;
+
+function loadImage(url, cb){
+  const img = new Image();
+  img.crossOrigin = 'anonymous';
+  img.onload = ()=>{cb(null,img)};
+  img.onerror = ()=>{cb(new Error('load failed'))};
+  img.src = url;
+}
+
+loadImage(PLANE_URL, (err,img)=>{ if(!err) planeImg = img; imagesLoaded++; });
+loadImage(EXPLOSION_URL, (err,img)=>{ if(!err) explosionImg = img; imagesLoaded++; });
+
+// Game state
+let running = true;
+let gameActive = false;
+let gameOver = false;
+let bird = null;
+let pipes = [];
+let score = 0;
+let bestScore = 0;
+let exploding = false;
+let explosionPos = {x:0,y:0};
+let explosionTimer = 0;
+const EXPLOSION_DURATION = 900; // ms
+
+function Bird(){
+  this.x = BIRD_X;
+  this.y = HEIGHT/2;
+  this.width = BIRD_WIDTH;
+  this.height = BIRD_HEIGHT;
+  this.dy = 0;
+  this.angle = 0;
+}
+Bird.prototype.flap = function(){ this.dy = FLAP_STRENGTH; }
+Bird.prototype.update = function(){
+  this.dy += GRAVITY;
+  if(this.dy > MAX_DROP_SPEED) this.dy = MAX_DROP_SPEED;
+  this.y += this.dy;
+  this.angle = Math.max(-25, Math.min(60, -this.dy * 3));
+}
+Bird.prototype.getRect = function(){ return {x:this.x, y:this.y, w:this.width, h:this.height}; }
+Bird.prototype.draw = function(ctx){
+  if(planeImg){
+    // draw rotated
+    ctx.save();
+    ctx.translate(this.x + this.width/2, this.y + this.height/2);
+    ctx.rotate((-this.angle) * Math.PI / 180); // negative because canvas y goes down
+    ctx.drawImage(planeImg, -this.width/2, -this.height/2, this.width, this.height);
+    ctx.restore();
+  } else {
+    // fallback simple shape
+    ctx.save();
+    ctx.translate(this.x + this.width/2, this.y + this.height/2);
+    ctx.rotate((-this.angle) * Math.PI / 180);
+    ctx.fillStyle = '#ffd200';
+    roundRect(ctx, -this.width/2, -this.height/2, this.width, this.height, this.height/2, true, false);
+    ctx.restore();
+  }
+}
+
+function roundRect(ctx, x, y, w, h, r, fill, stroke){
+  if (r === undefined) r = 5;
+  ctx.beginPath();
+  ctx.moveTo(x+r, y);
+  ctx.arcTo(x+w, y, x+w, y+h, r);
+  ctx.arcTo(x+w, y+h, x, y+h, r);
+  ctx.arcTo(x, y+h, x, y, r);
+  ctx.arcTo(x, y, x+w, y, r);
+  ctx.closePath();
+  if(fill) ctx.fill();
+  if(stroke) ctx.stroke();
+}
+
+function Pipe(x){
+  this.x = x;
+  this.width = PIPE_WIDTH;
+  const margin_top = 60;
+  const margin_bottom = GROUND_HEIGHT + 40;
+  const gap_y = Math.floor(Math.random() * (HEIGHT - PIPE_GAP - margin_bottom - (margin_top + 40) + 1)) + (margin_top + 40);
+  this.gap_top = gap_y;
+  this.gap_bottom = gap_y + PIPE_GAP;
+  this.passed = false;
+}
+Pipe.prototype.rects = function(){
+  const top = {x:this.x, y:0, w:this.width, h:this.gap_top};
+  const bottom = {x:this.x, y:this.gap_bottom, w:this.width, h: HEIGHT - this.gap_bottom - GROUND_HEIGHT};
+  return [top,bottom];
+}
+Pipe.prototype.update = function(){ this.x -= PIPE_SPEED; }
+Pipe.prototype.draw = function(ctx){
+  const [top,bottom] = this.rects();
+  ctx.fillStyle = '#228B22';
+  ctx.fillRect(top.x, top.y, top.w, top.h);
+  ctx.fillRect(bottom.x, bottom.y, bottom.w, bottom.h);
+}
+
+function rectCollide(a,b){
+  return !(a.x + a.w <= b.x || a.x >= b.x + b.w || a.y + a.h <= b.y || a.y >= b.y + b.h);
+}
+
+function checkCollision(bird, pipes){
+  if(bird.y <= 0 || bird.y + bird.height >= HEIGHT - GROUND_HEIGHT) return true;
+  const br = bird.getRect();
+  for(const p of pipes){
+    const [top,bottom] = p.rects();
+    if(rectCollide(br, top) || rectCollide(br, bottom)) return true;
+  }
+  return false;
+}
+
+// input
+window.addEventListener('keydown', (e)=>{
+  if(e.code === 'Space'){
+    if(!gameActive){ startGame(); }
+    bird.flap();
+  }
+  if(e.key.toLowerCase() === 'r' && gameOver){ startGame(); }
+  if(e.key === 'Escape'){ running = false; }
+});
+canvas.addEventListener('mousedown', (e)=>{
+  if(e.button === 0){ if(!gameActive) startGame(); bird.flap(); }
+});
+
+function startGame(){
+  gameActive = true; gameOver = false; exploding = false; explosionTimer = 0; score = 0;
+  bird = new Bird(); pipes = [new Pipe(WIDTH + i*PIPE_DISTANCE) for (let i=0;i<2;i++)];
+}
+
+// Polyfill array comprehension used above—replace with explicit loop
+function resetGameStart(){ bird = new Bird(); pipes = []; for(let i=0;i<2;i++) pipes.push(new Pipe(WIDTH + i*PIPE_DISTANCE)); }
+
+resetGameStart();
+
+let lastTime = performance.now();
+let accumulator = 0;
+const STEP = 1000 / FPS;
+
+function update(dt_ms){
+  if(gameActive && !gameOver){
+    bird.update();
+    // spawn
+    if(pipes.length === 0 || (pipes[pipes.length-1].x < WIDTH - PIPE_DISTANCE)){
+      pipes.push(new Pipe(WIDTH + 20));
+    }
+    const remove = [];
+    for(const p of pipes){
+      p.update();
+      if(!p.passed && (p.x + p.width) < bird.x){ p.passed = true; score++; }
+      if(p.x + p.width < -50) remove.push(p);
+    }
+    for(const r of remove){ const idx = pipes.indexOf(r); if(idx>=0) pipes.splice(idx,1); }
+
+    if(checkCollision(bird, pipes)){
+      gameOver = true; gameActive = false; if(score > bestScore) bestScore = score;
+      exploding = true; explosionPos = {x: bird.x + bird.width/2, y: bird.y + bird.height/2}; explosionTimer = 0;
+    }
+  }
+
+  // explosion timer
+  if(exploding){ explosionTimer += dt_ms; if(explosionTimer >= EXPLOSION_DURATION) exploding = false; }
+}
+
+function draw(){
+  // clear
+  ctx.clearRect(0,0,WIDTH,HEIGHT);
+  // sky already canvas background
+
+  // pipes
+  for(const p of pipes) p.draw(ctx);
+
+  // ground
+  ctx.fillStyle = '#543B23';
+  ctx.fillRect(0, HEIGHT - GROUND_HEIGHT, WIDTH, GROUND_HEIGHT);
+
+  // bird (hidden during explosion when gameOver and explosion image exists)
+  if(!(gameOver && exploding && explosionImg)) bird.draw(ctx);
+
+  // score
+  ctx.fillStyle = '#111'; ctx.font = '24px Arial'; ctx.fillText('Score: ' + score, 16, 30);
+
+  // splash
+  if(!gameActive && !gameOver){
+    ctx.fillStyle = '#111'; ctx.font = '56px Arial bold'; ctx.textAlign = 'center'; ctx.fillText('Flappy Plane', WIDTH/2, HEIGHT/2 - 30);
+    ctx.font = '20px Arial'; ctx.fillText('Press SPACE or Click to start', WIDTH/2, HEIGHT/2 + 10);
+    ctx.textAlign = 'left';
+  }
+
+  // game over
+  if(gameOver){
+    ctx.fillStyle = '#111'; ctx.font = '56px Arial bold'; ctx.textAlign = 'center'; ctx.fillText('Game Over', WIDTH/2, HEIGHT/2 - 30);
+    ctx.font = '24px Arial'; ctx.fillText('Score: ' + score + '    Best: ' + bestScore, WIDTH/2, HEIGHT/2 + 8);
+    ctx.font = '16px Arial'; ctx.fillText('Press R to restart or ESC to quit', WIDTH/2, HEIGHT/2 + 48);
+    ctx.textAlign = 'left';
+  }
+
+  // explosion
+  if(exploding && explosionImg){
+    const t = explosionTimer / EXPLOSION_DURATION;
+    const scaleFactor = 1.0 + 0.15 * (1 - Math.abs(t * 2 - 1));
+    const size = Math.floor(EXPLOSION_SIZE * scaleFactor);
+    ctx.drawImage(explosionImg, explosionPos.x - size/2, explosionPos.y - size/2, size, size);
+  } else if(exploding && !explosionImg){
+    ctx.fillStyle = 'rgb(255,80,0)';
+    ctx.beginPath(); ctx.arc(explosionPos.x, explosionPos.y, 40, 0, Math.PI*2); ctx.fill();
+  }
+}
+
+function loop(now){
+  if(!running) return; // quit loop
+  const dt = now - lastTime; lastTime = now;
+  accumulator += dt;
+  while(accumulator >= STEP){ update(STEP); accumulator -= STEP; }
+  draw();
+  requestAnimationFrame(loop);
+}
+
+requestAnimationFrame(loop);
+
+// Small helper to show instructions in the page
+info.innerHTML = 'Controls: SPACE / Left Click — flap. R — restart. ESC — quit (stops the loop).';
+centerHint.innerHTML = '';
+
+</script>
+</body>
+</html>
